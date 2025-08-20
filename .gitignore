@@ -37,7 +37,6 @@ local_settings.py
 temp_uploads/*
 temp_clips/*
 bin/*
-models/*
 
 # Ignore system files
 .DS_Store

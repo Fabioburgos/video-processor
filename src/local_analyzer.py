@@ -1,9 +1,10 @@
+import openai
 import requests
 import json
 import os
 import logging
 import time
-import openai
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -13,7 +14,7 @@ OLLAMA_URL = "http://localhost:11434"
 # Configura tu clave API de OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    logger.warning("⚠️ OPENAI_API_KEY no está configurada. Algunas funciones pueden fallar.")
+    logger.warning("⚠️ OPENAI_API_KEY no está configurada. Solo funcionará modo Ollama.")
 
 def diagnosticar_ollama():
     """
@@ -110,12 +111,12 @@ def instalar_modelo_si_necesario(modelo="llama3"):
         logger.error(f"❌ Error al instalar modelo {modelo}: {str(e)}")
         return False
 
-def analizar_con_ollama_mejorado(modelo, ruta_prompt, transcripcion_texto):
+def analizar_con_ollama_puro(modelo, ruta_prompt, transcripcion_texto):
     """
-    Versión mejorada del análisis usando OpenAI
+    Versión que usa SOLO Ollama (sin OpenAI)
     
     Args:
-        modelo (str): Nombre del modelo de OpenAI
+        modelo (str): Nombre del modelo de Ollama
         ruta_prompt (str): Ruta al archivo de prompt
         transcripcion_texto (str): Texto a analizar
     
@@ -125,16 +126,94 @@ def analizar_con_ollama_mejorado(modelo, ruta_prompt, transcripcion_texto):
     try:
         diagnostico = diagnosticar_ollama()
         if not diagnostico["conexion"]:
-            logger.error("❌ No hay conexión con OpenAI")
+            logger.error("❌ No hay conexión con Ollama")
             return None
 
         modelo_usar = modelo
         if modelo not in diagnostico["modelos"]:
-            logger.warning(f"⚠️ Modelo {modelo} no está en la lista recomendada. Usando recomendado.")
-            modelo_usar = diagnostico["modelo_recomendado"]
+            if diagnostico["modelo_recomendado"]:
+                logger.warning(f"⚠️ Modelo {modelo} no disponible. Usando {diagnostico['modelo_recomendado']}")
+                modelo_usar = diagnostico["modelo_recomendado"]
+            else:
+                logger.error("❌ No hay modelos disponibles")
+                return None
+
+        prompt_sistema = leer_prompt_mejorado(ruta_prompt)
+        if not prompt_sistema:
+            logger.error("❌ No se pudo leer el prompt")
+            return None
+
+        mensaje_completo = f"""{prompt_sistema}
+
+TRANSCRIPCIÓN A ANALIZAR:
+{transcripcion_texto[:3000]}...
+
+Por favor, analiza la transcripción y proporciona calificaciones numéricas claras."""
+
+        max_intentos = 3
+        for intento in range(max_intentos):
+            try:
+                data = {
+                    "model": modelo_usar,
+                    "prompt": mensaje_completo,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.3,
+                        "num_predict": 1500,
+                        "top_p": 0.9
+                    }
+                }
+
+                response = requests.post(
+                    f"{OLLAMA_URL}/api/generate",
+                    json=data,
+                    timeout=120
+                )
+
+                if response.status_code == 200:
+                    respuesta_data = response.json()
+                    texto_analisis = respuesta_data.get("response", "").strip()
+                    
+                    if texto_analisis:
+                        logger.info(f"✅ Análisis completado (intento {intento + 1})")
+                        logger.info(f"📊 Longitud del análisis: {len(texto_analisis)} caracteres")
+                        return texto_analisis
+                    else:
+                        logger.warning(f"⚠️ Respuesta vacía en intento {intento + 1}")
+                else:
+                    logger.error(f"❌ Error HTTP {response.status_code} en intento {intento + 1}")
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"❌ Error de conexión en intento {intento + 1}: {str(e)}")
+
+            time.sleep(2)
+
+        logger.error("❌ Se agotaron todos los intentos")
+        return None
+
+    except Exception as e:
+        logger.error(f"❌ Error inesperado en análisis: {str(e)}")
+        return None
+
+def analizar_con_openai_puro(modelo, ruta_prompt, transcripcion_texto):
+    """
+    Versión que usa correctamente OpenAI
+    
+    Args:
+        modelo (str): Nombre del modelo de OpenAI (ej: 'gpt-3.5-turbo', 'gpt-4')
+        ruta_prompt (str): Ruta al archivo de prompt
+        transcripcion_texto (str): Texto a analizar
+    
+    Returns:
+        str: Análisis generado o None si hay error
+    """
+    try:
+        if not OPENAI_API_KEY:
+            logger.error("❌ OPENAI_API_KEY no está configurada")
+            return None
 
         # Configurar cliente OpenAI
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
         prompt_sistema = leer_prompt_mejorado(ruta_prompt)
         if not prompt_sistema:
@@ -153,11 +232,18 @@ Por favor, analiza la transcripción y proporciona calificaciones numéricas cla
             {"role": "user", "content": mensaje_completo}
         ]
 
+        # Modelos válidos de OpenAI
+        modelos_validos = ["gpt-4.1-nano","gpt-4o-mini"]
+        modelo_usar = modelo if modelo in modelos_validos else "gpt-3.5-turbo"
+
+        if modelo_usar != modelo:
+            logger.warning(f"⚠️ Modelo {modelo} no válido. Usando {modelo_usar}")
+
         max_intentos = 3
         for intento in range(max_intentos):
             try:
                 response = client.chat.completions.create(
-                    model="gpt-4.1-nano",
+                    model=modelo_usar,
                     messages=messages,
                     temperature=0.3,
                     max_tokens=1500,
@@ -181,6 +267,37 @@ Por favor, analiza la transcripción y proporciona calificaciones numéricas cla
 
     except Exception as e:
         logger.error(f"❌ Error inesperado en análisis: {str(e)}")
+        return None
+
+def analizar_con_ollama_mejorado(modelo, ruta_prompt, transcripcion_texto):
+    """
+    Función inteligente que decide automáticamente entre Ollama y OpenAI
+    
+    Args:
+        modelo (str): Nombre del modelo
+        ruta_prompt (str): Ruta al archivo de prompt
+        transcripcion_texto (str): Texto a analizar
+    
+    Returns:
+        str: Análisis generado o None si hay error
+    """
+    # Primero intentar con Ollama si está disponible
+    diagnostico = diagnosticar_ollama()
+    if diagnostico["conexion"] and diagnostico["modelos"]:
+        logger.info("🔧 Usando Ollama local...")
+        return analizar_con_ollama_puro(modelo, ruta_prompt, transcripcion_texto)
+    
+    # Si Ollama no está disponible, intentar con OpenAI
+    elif OPENAI_API_KEY:
+        logger.info("🌐 Ollama no disponible, usando OpenAI...")
+        return analizar_con_openai_puro(modelo, ruta_prompt, transcripcion_texto)
+    
+    # Si ninguno está disponible
+    else:
+        logger.error("❌ Ni Ollama ni OpenAI están disponibles")
+        logger.error("💡 Opciones:")
+        logger.error("   - Instalar y ejecutar Ollama: ollama serve")
+        logger.error("   - Configurar OPENAI_API_KEY")
         return None
 
 def leer_prompt_mejorado(ruta_prompt):
@@ -299,6 +416,45 @@ def probar_ollama_basico():
     
     return resultado
 
+def probar_openai_basico():
+    """
+    Prueba básica de funcionamiento de OpenAI
+    
+    Returns:
+        dict: Resultado de la prueba
+    """
+    resultado = {
+        "exito": False,
+        "modelo_usado": None,
+        "respuesta": None,
+        "error": None
+    }
+    
+    try:
+        if not OPENAI_API_KEY:
+            resultado["error"] = "OPENAI_API_KEY no está configurada"
+            return resultado
+        
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        modelo = "gpt-3.5-turbo"
+        resultado["modelo_usado"] = modelo
+        
+        response = client.chat.completions.create(
+            model=modelo,
+            messages=[{"role": "user", "content": "Responde solo con 'OK' si me entiendes."}],
+            max_tokens=10,
+            temperature=0.1
+        )
+        
+        respuesta_texto = response.choices[0].message.content.strip()
+        resultado["exito"] = True
+        resultado["respuesta"] = respuesta_texto
+        
+    except Exception as e:
+        resultado["error"] = str(e)
+    
+    return resultado
+
 def generar_comando_instalacion():
     """
     Genera comandos para instalar modelos recomendados
@@ -307,17 +463,84 @@ def generar_comando_instalacion():
         list: Lista de comandos
     """
     comandos = [
+        "# Instalar Ollama",
+        "curl -fsSL https://ollama.ai/install.sh | sh",
+        "",
+        "# Descargar modelos recomendados",
         "ollama pull llama3",
         "ollama pull mistral", 
         "ollama pull phi",
+        "",
+        "# Iniciar servidor",
         "ollama serve"
     ]
     
     return comandos
 
-# Función para uso directo en el script principal
+def mostrar_estado_sistema():
+    """
+    Muestra el estado actual del sistema
+    """
+    print("=" * 50)
+    print("🔍 DIAGNÓSTICO DEL SISTEMA")
+    print("=" * 50)
+    
+    # Verificar Ollama
+    print("\n📱 OLLAMA:")
+    diagnostico = diagnosticar_ollama()
+    if diagnostico["conexion"]:
+        print(f"✅ Conectado - Modelos: {len(diagnostico['modelos'])}")
+        if diagnostico["modelos"]:
+            print(f"   Modelos disponibles: {', '.join(diagnostico['modelos'])}")
+            print(f"   Modelo recomendado: {diagnostico['modelo_recomendado']}")
+    else:
+        print("❌ No conectado")
+        print("💡 Para instalar:")
+        for cmd in generar_comando_instalacion():
+            print(f"   {cmd}")
+    
+    # Verificar OpenAI
+    print("\n🌐 OPENAI:")
+    if OPENAI_API_KEY:
+        print("✅ API Key configurada")
+        # Hacer prueba rápida
+        prueba = probar_openai_basico()
+        if prueba["exito"]:
+            print("✅ Conexión exitosa")
+        else:
+            print(f"❌ Error: {prueba['error']}")
+    else:
+        print("❌ API Key no configurada")
+        print("💡 Para configurar:")
+        print("   export OPENAI_API_KEY='tu-api-key-aqui'")
+    
+    print("=" * 50)
+
+# Función para uso directo en el script principal (compatible con código existente)
 def analizar_con_ollama(modelo, ruta_prompt, transcripcion_texto):
     """
     Función principal para compatibilidad con el código existente
+    Ahora es inteligente y usa la mejor opción disponible
     """
     return analizar_con_ollama_mejorado(modelo, ruta_prompt, transcripcion_texto)
+
+# Función de prueba para verificar que todo funciona
+def main():
+    """
+    Función de prueba
+    """
+    mostrar_estado_sistema()
+    
+    # Prueba básica
+    print("\n🧪 PRUEBA BÁSICA:")
+    resultado = analizar_con_ollama_mejorado(
+        "llama3", 
+        None,  # Usar prompt por defecto
+        "El profesor explicó matemáticas y el estudiante hizo preguntas."
+    )
+    
+    if resultado:
+        print("✅ Análisis exitoso:")
+        print(resultado[:200] + "..." if len(resultado) > 200 else resultado)
+    else:
+        print("❌ No se pudo realizar el análisis")
